@@ -1,0 +1,5 @@
+*.wav
+*.tmp
+*.log
+*.profraw
+.DS_Store

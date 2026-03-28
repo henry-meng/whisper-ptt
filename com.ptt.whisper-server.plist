@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ptt.whisper-server</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/whisper-server</string>
+		<string>--model</string>
+		<string>__WHISPER_MODEL_PATH__</string>
+		<string>--host</string>
+		<string>127.0.0.1</string>
+		<string>--port</string>
+		<string>7178</string>
+		<string>--language</string>
+		<string>en</string>
+		<string>--no-timestamps</string>
+		<string>--prompt</string>
+		<string>your vocabulary hint words here</string>
+		<string>--flash-attn</string>
+		<string>--suppress-nst</string>
+	</array>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.config/ptt/whisper-server.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.config/ptt/whisper-server-error.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>15</integer>
+</dict>
+</plist>
