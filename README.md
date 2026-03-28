@@ -1,13 +1,13 @@
 # whisper-ptt
 
-Fully local push-to-talk voice transcription for macOS. Hold a key, speak, release — transcribed text is pasted at your cursor. No cloud APIs, no latency, no data leaves your machine.
+Fully local push-to-talk voice transcription for macOS. Hold a key, speak, release — transcribed text is pasted at your cursor. No cloud APIs, no network latency, no data leaves your machine.
 
 Built on [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (server mode), [Hammerspoon](https://www.hammerspoon.org/), and [SoX](https://sox.sourceforge.net/).
 
 ## How it works
 
 ```
-Insert key held → sox records audio in chunks (split on silence)
+Insert key held → sox records audio in chunks (split on 0.4s silence or 5s max)
     → each chunk sent to local whisper.cpp server (HTTP POST)
     → transcription passed through word-fixes.pl
     → text pasted via Cmd+V at cursor position
@@ -196,11 +196,13 @@ These are processed by `word-fixes.pl` after transcription:
 | "em dash" | `—` |
 | "ellipsis" | `…` |
 | "tab key" | Tab character |
-| "scratch that" | Undo last phrase (Cmd+Z) |
+| "scratch that" | Undo last phrase (Cmd+Z) * |
 | "period" (at end of phrase) | `.` |
 | "comma" (at end of phrase) | `,` |
 | "question mark" (at end of phrase) | `?` |
 | "exclamation mark" (at end of phrase) | `!` |
+
+*"Scratch that" is handled directly in `init.lua`, not `word-fixes.pl` — it triggers Cmd+Z rather than a text substitution.
 
 Periods, commas, question marks, and exclamation points are also inserted automatically by Whisper based on speech prosody — you usually don't need to say them.
 
@@ -237,7 +239,7 @@ This was a known issue with the default SoX silence detection settings and has b
 
 The tool uses Cmd+V to paste. Some apps (terminals, VMs) intercept or handle Cmd+V differently. The tool saves and restores your clipboard contents after pasting.
 
-### macOS 15+ (Tahoe) audio issues
+### macOS 15+ (Sequoia) audio issues
 
 If `rec` fails with CoreAudio buffer errors, install `sox_ng` instead of `sox`:
 
