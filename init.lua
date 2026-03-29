@@ -763,10 +763,8 @@ local function startRecording()
         if isRecording then
             logWarn("Session " .. sessionId .. ": watchdog fired at " .. MAX_SESSION_SECONDS .. "s")
             hs.alert.show("PTT: Max duration reached", 2)
-            stopRequested = true
-            if currentRecordingTask and currentRecordingTask:isRunning() then
-                currentRecordingTask:terminate()
-            end
+            insertKeyIsDown = false  -- force reset in case keyUp was lost
+            stopRecording()
         end
     end)
 
@@ -943,6 +941,18 @@ end
 local eventTapWatchdog = hs.timer.new(30, function()
     if not keyWatcher:isEnabled() then
         restartEventTap()
+    end
+
+    -- Safety valve: if insertKeyIsDown is stuck true but recording has ended,
+    -- the keyUp event was likely lost (macOS kCGEventTapDisabledByTimeout).
+    -- Reset so the next keyDown can start a new session.
+    if insertKeyIsDown and not isRecording and activeTranscriptions == 0 then
+        logWarn("Safety valve: insertKeyIsDown stuck after session ended — resetting (keyUp likely lost)")
+        insertKeyIsDown = false
+        if keyUpDebounceTimer then
+            keyUpDebounceTimer:stop()
+            keyUpDebounceTimer = nil
+        end
     end
 end)
 
