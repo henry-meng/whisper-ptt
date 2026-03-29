@@ -796,7 +796,14 @@ end
 
 -- ---------------------------------------------------------------------------
 -- Global Hotkey (Insert Key via EventTap)
+-- Wooting / analog keyboard debounce: rapid trigger can send real keyDown/keyUp
+-- pairs at 10-15 Hz from tiny finger movements. We debounce keyUp so that a
+-- quick re-press within DEBOUNCE_MS cancels the pending stop.
 -- ---------------------------------------------------------------------------
+
+local DEBOUNCE_MS           = 80      -- ms to wait after keyUp before actually stopping
+local keyUpDebounceTimer    = nil
+local insertKeyIsDown       = false   -- tracks logical key state (debounced)
 
 local keyWatcher = hs.eventtap.new({
     hs.eventtap.event.types.keyDown,
@@ -821,12 +828,30 @@ local keyWatcher = hs.eventtap.new({
     end
 
     if event:getType() == hs.eventtap.event.types.keyDown then
-        logDebug("Insert key DOWN (keyCode=" .. keyCode .. ")")
-        startRecording()
+        -- Cancel any pending debounced stop
+        if keyUpDebounceTimer then
+            keyUpDebounceTimer:stop()
+            keyUpDebounceTimer = nil
+        end
+
+        if not insertKeyIsDown then
+            insertKeyIsDown = true
+            logDebug("Insert key DOWN (keyCode=" .. keyCode .. ")")
+            startRecording()
+        end
         return true
+
     elseif event:getType() == hs.eventtap.event.types.keyUp then
-        logDebug("Insert key UP (keyCode=" .. keyCode .. ")")
-        stopRecording()
+        -- Don't stop immediately — debounce for analog/rapid-trigger keyboards
+        if keyUpDebounceTimer then
+            keyUpDebounceTimer:stop()
+        end
+        keyUpDebounceTimer = hs.timer.doAfter(DEBOUNCE_MS / 1000, function()
+            keyUpDebounceTimer = nil
+            insertKeyIsDown = false
+            logDebug("Insert key UP (debounced, keyCode=" .. keyCode .. ")")
+            stopRecording()
+        end)
         return true
     end
 
