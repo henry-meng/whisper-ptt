@@ -362,6 +362,13 @@ local function enqueuePasteOrdered(chunkIndex, text)
     while pasteQueue[nextPasteIndex] ~= nil do
         local entry = pasteQueue[nextPasteIndex]
         if entry and entry ~= false then
+            -- Prepend space between phrases (within and across sessions)
+            -- This runs in paste-order (not arrival-order) so spacing is correct
+            -- even when transcriptions complete out of order
+            if hasPastedInSession or (os.time() - lastPasteTimestamp) < 10 then
+                entry = " " .. entry
+            end
+            hasPastedInSession = true
             table.insert(pendingPastes, entry)
         end
         pasteQueue[nextPasteIndex] = nil
@@ -552,11 +559,6 @@ local function transcribeChunk(chunkFile, chunkIndex, expectedSessionId)
                         scratchLastPhrase()
                         enqueuePasteOrdered(chunkIndex, false)
                     else
-                        -- Prepend space between phrases (within and across sessions)
-                        if hasPastedInSession or (os.time() - lastPasteTimestamp) < 10 then
-                            text = " " .. text
-                        end
-                        hasPastedInSession = true
                         enqueuePasteOrdered(chunkIndex, text)
                     end
                 else
