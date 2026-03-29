@@ -1,9 +1,6 @@
 -- ==========================================================================
--- whisper-ptt: Push-to-Talk Local Transcription
+-- Push-to-Talk for Claude Code
 -- Hold Insert to speak → chunk-based transcription → clipboard paste
---
--- Requires: Hammerspoon, whisper.cpp (server mode), sox_ng
--- See README.md for setup instructions.
 -- ==========================================================================
 
 require("hs.ipc")  -- enable CLI debugging via `hs` command
@@ -579,100 +576,133 @@ local function transcribeChunk(chunkFile, chunkIndex, expectedSessionId)
 end
 
 -- ---------------------------------------------------------------------------
--- Recording Loop
+-- Recording (single-process, multi-file via sox newfile:restart)
+-- One `rec` process runs for the entire session. Sox splits on silence and
+-- writes numbered chunk files. A polling timer detects new files and sends
+-- them to transcription. This eliminates CoreAudio reinit between chunks,
+-- which caused audible clicking/popping artifacts.
 -- ---------------------------------------------------------------------------
 
-local function recordChunk()
-    if stopRequested or cancelRequested then
-        logDebug("recordChunk: stop/cancel requested, ending recording loop")
-        hideFloatingIndicator()
-        isRecording = false
-        if activeTranscriptions == 0 then
-            showIdle()
-            restoreClipboard()
-        else
-            showTranscribing()
-            logDebug("Waiting for " .. activeTranscriptions .. " active transcriptions to complete")
-        end
-        return
-    end
+local chunkPollTimer        = nil
+local lastProcessedChunk    = 0       -- highest chunk number we've processed
+local recBaseFile           = ""      -- base filename for sox newfile output
 
-    chunkCount = chunkCount + 1
-    local thisChunkIndex = chunkCount
+-- Sox newfile:restart names files: base001.wav, base002.wav, base003.wav, ...
+-- (the un-numbered base file is never created)
+local function chunkFilePath(chunkNumber)
+    return recBaseFile:gsub("%.wav$", string.format("%03d.wav", chunkNumber))
+end
+
+local function processNewChunks()
+    if cancelRequested then return end
+
     local currentSessionId = sessionId
-    local chunkFile = string.format(
-        "%s/chunk-%d-%04d.wav", RECORDING_DIR, currentSessionId, thisChunkIndex
-    )
 
-    chunkStartTimes[thisChunkIndex] = hs.timer.secondsSinceEpoch()
+    -- Scan for new chunk files
+    while true do
+        local nextChunk = lastProcessedChunk + 1
+        local candidatePath = chunkFilePath(nextChunk)
+        local attr = hs.fs.attributes(candidatePath)
 
-    logDebug(string.format("Chunk %d: starting rec → %s", thisChunkIndex, chunkFile))
+        if not attr then break end -- no more files yet
 
-    -- sox silence args:
-    --   First triplet:  "1 0.01 0.1%"  — start capturing after just 10ms of sound above 0.1%
-    --                                     (nearly instant onset detection, prevents clipping first syllable)
-    --   Second triplet: "1 SILENCE_DURATION SILENCE_THRESHOLD" — stop when silence is detected
+        -- The file exists, but is sox still writing to it?
+        -- If the NEXT file exists, this one is definitely complete.
+        -- If rec has exited, this one is also complete.
+        -- Otherwise, wait for next poll cycle.
+        local nextNextPath = chunkFilePath(nextChunk + 1)
+        local recStillRunning = currentRecordingTask and currentRecordingTask:isRunning()
+        local nextFileExists = hs.fs.attributes(nextNextPath) ~= nil
+
+        if not nextFileExists and recStillRunning then
+            -- This file might still be open for writing — wait
+            break
+        end
+
+        -- This chunk is complete — process it
+        lastProcessedChunk = nextChunk
+        chunkCount = nextChunk
+
+        local fileSize = attr.size or 0
+        local audioDurationSeconds = fileSize > 44 and (fileSize - 44) / 32000 or 0
+
+        logDebug(string.format("Chunk %d: detected file=%s size=%d bytes (%.1fs audio)",
+            nextChunk, candidatePath, fileSize, audioDurationSeconds))
+
+        if fileSize < MIN_CHUNK_BYTES then
+            logDebug(string.format("Chunk %d: too small (%d < %d bytes), skipping",
+                nextChunk, fileSize, MIN_CHUNK_BYTES))
+            os.remove(candidatePath)
+            enqueuePasteOrdered(nextChunk, false)
+        else
+            activeTranscriptions = activeTranscriptions + 1
+            transcribeChunk(candidatePath, nextChunk, currentSessionId)
+        end
+    end
+end
+
+local function startRecordingProcess()
+    local currentSessionId = sessionId
+    recBaseFile = string.format("%s/chunk-%d.wav", RECORDING_DIR, currentSessionId)
+    lastProcessedChunk = 0
+
+    logDebug("Starting single rec process → " .. recBaseFile)
+
+    -- Single rec process for the entire session.
+    -- sox `: newfile : restart` splits on silence into numbered files
+    -- without reopening CoreAudio between chunks.
     currentRecordingTask = hs.task.new(REC_BINARY, function(exitCode, _stdout, stderr)
         currentRecordingTask = nil
 
-        local chunkEndTime = hs.timer.secondsSinceEpoch()
-        local chunkRecordDuration = chunkEndTime - (chunkStartTimes[thisChunkIndex] or chunkEndTime)
+        logInfo(string.format("rec process exited (exit=%d, stderr=%s)",
+            exitCode or -1, (stderr and stderr ~= "") and stderr or "none"))
 
-        -- Check the file
-        local attr = hs.fs.attributes(chunkFile)
-        local fileSize = attr and attr.size or 0
+        -- Process any remaining chunk files
+        processNewChunks()
 
-        logInfo(string.format("Chunk %d: rec finished (exit=%d, %.1fs recording, %d bytes, stderr=%s)",
-            thisChunkIndex, exitCode or -1, chunkRecordDuration, fileSize, (stderr and stderr ~= "") and stderr or "none"))
-
-        -- Gate: ignore if session changed
-        if currentSessionId ~= sessionId then
-            logDebug("Chunk " .. thisChunkIndex .. ": stale session, discarding file")
-            os.remove(chunkFile)
-            return
-        end
-
-        -- Track this transcription
-        activeTranscriptions = activeTranscriptions + 1
-
-        -- Start next chunk IMMEDIATELY (overlap recording + transcription)
-        if isRecording and not stopRequested and not cancelRequested then
-            logDebug("Chunk " .. thisChunkIndex .. ": starting next chunk (overlap)")
-            recordChunk()
-        else
+        -- Session teardown (if not already torn down by stopRecording)
+        if isRecording then
             isRecording = false
             hideFloatingIndicator()
-            if activeTranscriptions > 0 then
-                showTranscribing()
-            else
-                showIdle()
-                restoreClipboard()
-            end
         end
 
-        -- Transcribe this chunk in parallel with the next recording
-        transcribeChunk(chunkFile, thisChunkIndex, currentSessionId)
+        if chunkPollTimer then
+            chunkPollTimer:stop()
+            chunkPollTimer = nil
+        end
+
+        if activeTranscriptions > 0 then
+            showTranscribing()
+        else
+            sessionFinished()
+        end
 
     end, {
-        "-q", "--buffer", "1024",
+        "-q",
         "-r", "16000", "-c", "1", "-b", "16",
-        chunkFile,
-        -- Leading silence trim: 10ms onset detection at 0.1% threshold
-        -- This is the fix for first-syllable clipping — previous was 0.3s at 1%
+        recBaseFile,
         "silence", "1", "0.01", "0.1%",
-        -- Trailing silence: stop after SILENCE_DURATION below SILENCE_THRESHOLD
         "1", SILENCE_DURATION, SILENCE_THRESHOLD,
         "trim", "0", tostring(MAX_CHUNK_SECONDS),
+        ":", "newfile", ":", "restart",
     })
 
     if not currentRecordingTask:start() then
-        logError("Failed to start rec process for chunk " .. thisChunkIndex)
+        logError("Failed to start rec process")
         hs.alert.show("PTT Error: Failed to start recording", 3)
         playErrorSound()
         isRecording = false
         hideFloatingIndicator()
         showIdle()
+        return
     end
+
+    -- Poll for new chunk files every 200ms
+    chunkPollTimer = hs.timer.doEvery(0.2, function()
+        if not cancelRequested then
+            processNewChunks()
+        end
+    end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -731,7 +761,7 @@ local function startRecording()
         end
     end)
 
-    recordChunk()
+    startRecordingProcess()
 end
 
 local function stopRecording()
@@ -748,11 +778,22 @@ local function stopRecording()
         watchdogTimer = nil
     end
 
-    -- SIGTERM the rec process so it flushes and finalizes the WAV header
+    -- SIGTERM the rec process so it flushes and finalizes the WAV header.
+    -- The rec exit callback handles final chunk processing and teardown.
     if currentRecordingTask and currentRecordingTask:isRunning() then
         logDebug("Sending SIGTERM to rec process")
         currentRecordingTask:terminate()
     end
+
+    if chunkPollTimer then
+        chunkPollTimer:stop()
+        chunkPollTimer = nil
+    end
+
+    hideFloatingIndicator()
+    isRecording = false
+    -- Note: don't call processNewChunks() here — rec hasn't flushed yet.
+    -- The rec exit callback will process remaining files.
 end
 
 local function cancelRecording()
@@ -767,6 +808,11 @@ local function cancelRecording()
     if watchdogTimer then
         watchdogTimer:stop()
         watchdogTimer = nil
+    end
+
+    if chunkPollTimer then
+        chunkPollTimer:stop()
+        chunkPollTimer = nil
     end
 
     if currentRecordingTask and currentRecordingTask:isRunning() then
@@ -801,7 +847,7 @@ end
 -- quick re-press within DEBOUNCE_MS cancels the pending stop.
 -- ---------------------------------------------------------------------------
 
-local DEBOUNCE_MS           = 80      -- ms to wait after keyUp before actually stopping
+local DEBOUNCE_MS           = 300     -- ms to wait after keyUp before actually stopping (Wooting analog jitter tolerance)
 local keyUpDebounceTimer    = nil
 local insertKeyIsDown       = false   -- tracks logical key state (debounced)
 
@@ -828,10 +874,11 @@ local keyWatcher = hs.eventtap.new({
     end
 
     if event:getType() == hs.eventtap.event.types.keyDown then
-        -- Cancel any pending debounced stop
+        -- Cancel any pending debounced stop (Wooting analog jitter sends false keyUp)
         if keyUpDebounceTimer then
             keyUpDebounceTimer:stop()
             keyUpDebounceTimer = nil
+            logDebug("Debounce: cancelled false keyUp (key still held)")
         end
 
         if not insertKeyIsDown then
@@ -874,7 +921,7 @@ local function restartEventTap()
         hs.alert.show("PTT: Hotkey restored", 2)
     else
         logError("Event tap restart FAILED — accessibility permission likely revoked")
-        hs.alert.show("PTT: Hotkey broken — check Accessibility permissions", 5)
+        hs.alert.show("⚠ PTT: Hotkey broken — check Accessibility permissions", 5)
     end
 end
 
