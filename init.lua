@@ -27,7 +27,6 @@ local MAX_SESSION_SECONDS   = 120     -- watchdog: force-stop entire session
 local CLIPBOARD_RESTORE_MS  = 400     -- delay before restoring clipboard (ms)
 
 local INSERT_KEY_CODE       = 114     -- macOS "Help/Insert" key
-local ESCAPE_KEY_CODE       = 53      -- Escape key for cancel
 
 local ENABLE_SOUNDS         = true    -- set false to disable audio feedback
 local LOG_FILE              = os.getenv("HOME") .. "/.config/ptt/ptt-debug.log"
@@ -318,16 +317,26 @@ end
 -- Clipboard Paste (ordered queue)
 -- ---------------------------------------------------------------------------
 
+local clipboardRestoreRetries = 0
+local MAX_CLIPBOARD_RESTORE_RETRIES = 10
+
 local function restoreClipboard()
     hs.timer.doAfter(CLIPBOARD_RESTORE_MS / 1000, function()
         if savedClipboard then
             if pasteInProgress or #pendingPastes > 0 then
-                logDebug("Clipboard restore deferred — paste queue not drained")
-                restoreClipboard()
-                return
+                clipboardRestoreRetries = clipboardRestoreRetries + 1
+                if clipboardRestoreRetries >= MAX_CLIPBOARD_RESTORE_RETRIES then
+                    logWarn("Clipboard restore: gave up after " .. MAX_CLIPBOARD_RESTORE_RETRIES .. " retries, restoring now")
+                    pasteInProgress = false  -- unstick
+                else
+                    logDebug("Clipboard restore deferred — paste queue not drained")
+                    restoreClipboard()
+                    return
+                end
             end
             hs.pasteboard.setContents(savedClipboard)
             savedClipboard = nil
+            clipboardRestoreRetries = 0
             logDebug("Clipboard restored")
         end
     end)
@@ -746,6 +755,7 @@ local function startRecording()
 
     savedClipboard = hs.pasteboard.getContents()
 
+    escapeHotkey:enable()
     showRecording()
     showFloatingIndicator()
     playStartSound()
@@ -790,6 +800,7 @@ local function stopRecording()
         chunkPollTimer = nil
     end
 
+    escapeHotkey:disable()
     hideFloatingIndicator()
     isRecording = false
     -- Note: don't call processNewChunks() here — rec hasn't flushed yet.
@@ -804,6 +815,8 @@ local function cancelRecording()
 
     cancelRequested = true
     stopRequested = true
+
+    escapeHotkey:disable()
 
     if watchdogTimer then
         watchdogTimer:stop()
@@ -841,106 +854,95 @@ local function cancelRecording()
 end
 
 -- ---------------------------------------------------------------------------
--- Global Hotkey (Insert Key via EventTap)
--- Wooting / analog keyboard debounce: rapid trigger can send real keyDown/keyUp
--- pairs at 10-15 Hz from tiny finger movements. We debounce keyUp so that a
--- quick re-press within DEBOUNCE_MS cancels the pending stop.
+-- Global Hotkeys (hs.hotkey — press/release, no key repeat)
+--
+-- hs.hotkey fires pressedfn once on key-down and releasedfn once on key-up,
+-- regardless of hold duration or system key repeat rate. This avoids the
+-- macOS key repeat flooding that caused rapid start/stop cycling with
+-- hs.eventtap (Hammerspoon issues #1179, #1308).
+-- Wooting debounce retained for hardware-level rapid trigger jitter.
 -- ---------------------------------------------------------------------------
 
-local DEBOUNCE_MS           = 300     -- ms to wait after keyUp before actually stopping (Wooting analog jitter tolerance)
-local keyUpDebounceTimer    = nil
-local insertKeyIsDown       = false   -- tracks logical key state (debounced)
+local DEBOUNCE_MS        = 300     -- ms to wait after release before stopping (Wooting analog jitter)
+local keyUpDebounceTimer = nil
 
-local keyWatcher = hs.eventtap.new({
-    hs.eventtap.event.types.keyDown,
-    hs.eventtap.event.types.keyUp,
-}, function(event)
-    local keyCode = event:getKeyCode()
+-- Escape hotkey — only enabled during recording, disabled otherwise so
+-- Escape passes through to other apps normally
+local escapeHotkey = hs.hotkey.new({}, "escape", function()
+    cancelRecording()
+end)
 
-    -- Escape cancels recording
-    if keyCode == ESCAPE_KEY_CODE and isRecording then
-        if event:getType() == hs.eventtap.event.types.keyDown then
-            cancelRecording()
-            return true
-        end
-        return false
-    end
+-- Resolve Insert key name from keyCode (114 → "help" on macOS)
+local insertKeyName = hs.keycodes.map[INSERT_KEY_CODE]
+if not insertKeyName then
+    logError("No key name found for keyCode " .. INSERT_KEY_CODE .. ", falling back to 'help'")
+    insertKeyName = "help"
+end
 
-    if keyCode ~= INSERT_KEY_CODE then return false end
-
-    -- Ignore auto-repeat from holding the key
-    if event:getProperty(hs.eventtap.event.properties.keyboardEventAutorepeat) ~= 0 then
-        return true
-    end
-
-    if event:getType() == hs.eventtap.event.types.keyDown then
-        -- Cancel any pending debounced stop (Wooting analog jitter sends false keyUp)
+local insertHotkey = hs.hotkey.bind({}, insertKeyName,
+    -- pressedfn: fires once on key down (no repeats)
+    function()
+        -- Cancel any pending debounced stop (Wooting rapid trigger jitter)
         if keyUpDebounceTimer then
             keyUpDebounceTimer:stop()
             keyUpDebounceTimer = nil
-            logDebug("Debounce: cancelled false keyUp (key still held)")
+            logDebug("Debounce: cancelled pending stop (key re-pressed)")
+            return
         end
-
-        if not insertKeyIsDown then
-            insertKeyIsDown = true
-            logDebug("Insert key DOWN (keyCode=" .. keyCode .. ")")
-            startRecording()
-        end
-        return true
-
-    elseif event:getType() == hs.eventtap.event.types.keyUp then
-        -- Don't stop immediately — debounce for analog/rapid-trigger keyboards
+        logDebug("Insert key pressed (hs.hotkey)")
+        startRecording()
+    end,
+    -- releasedfn: fires once on key up
+    function()
+        -- Debounce for Wooting analog keyboards with rapid trigger
         if keyUpDebounceTimer then
             keyUpDebounceTimer:stop()
         end
         keyUpDebounceTimer = hs.timer.doAfter(DEBOUNCE_MS / 1000, function()
             keyUpDebounceTimer = nil
-            insertKeyIsDown = false
-            logDebug("Insert key UP (debounced, keyCode=" .. keyCode .. ")")
+            logDebug("Insert key released (debounced)")
             stopRecording()
         end)
-        return true
-    end
-
-    return false
-end)
+    end,
+    nil  -- no repeatfn — all key repeat events are suppressed
+)
 
 -- ---------------------------------------------------------------------------
--- Event Tap Watchdog
--- macOS can silently kill event taps (accessibility revocation, sleep/wake,
--- callback timeout). This timer detects dead taps and restarts them.
+-- Hotkey Watchdog
+-- macOS can silently disable hotkeys (accessibility revocation, sleep/wake).
+-- This timer detects dead hotkeys and restarts them.
 -- ---------------------------------------------------------------------------
 
-local function restartEventTap()
-    logWarn("Event tap is dead — attempting restart")
-    keyWatcher:stop()
-    keyWatcher:start()
+local function restartHotkey()
+    logWarn("Insert hotkey is disabled — attempting restart")
+    insertHotkey:disable()
+    insertHotkey:enable()
 
-    if keyWatcher:isEnabled() then
-        logInfo("Event tap restarted successfully")
+    if insertHotkey:isEnabled() then
+        logInfo("Insert hotkey restarted successfully")
         hs.alert.show("PTT: Hotkey restored", 2)
     else
-        logError("Event tap restart FAILED — accessibility permission likely revoked")
+        logError("Insert hotkey restart FAILED — accessibility permission likely revoked")
         hs.alert.show("⚠ PTT: Hotkey broken — check Accessibility permissions", 5)
     end
 end
 
-local eventTapWatchdog = hs.timer.new(30, function()
-    if not keyWatcher:isEnabled() then
-        restartEventTap()
+local hotkeyWatchdog = hs.timer.new(30, function()
+    if not insertHotkey:isEnabled() then
+        restartHotkey()
     end
 end)
 
--- Re-register event tap on wake from sleep (macOS often kills taps across sleep cycles)
+-- Re-check hotkey on wake from sleep (macOS often kills event taps across sleep cycles)
 local sleepWatcher = hs.caffeinate.watcher.new(function(eventType)
     if eventType == hs.caffeinate.watcher.systemDidWake then
-        logInfo("System woke from sleep — checking event tap health")
+        logInfo("System woke from sleep — checking hotkey health")
         -- Short delay: accessibility subsystem needs a moment after wake
         hs.timer.doAfter(2, function()
-            if not keyWatcher:isEnabled() then
-                restartEventTap()
+            if not insertHotkey:isEnabled() then
+                restartHotkey()
             else
-                logDebug("Event tap healthy after wake")
+                logDebug("Insert hotkey healthy after wake")
             end
         end)
     end
@@ -969,8 +971,8 @@ killOrphanedRecProcesses()
 validateWordFixes()
 
 showServerDown()
-keyWatcher:start()
-eventTapWatchdog:start()
+-- insertHotkey is already enabled by hs.hotkey.bind()
+hotkeyWatchdog:start()
 sleepWatcher:start()
 checkServerHealth()
 
