@@ -297,7 +297,11 @@ local healthCheckTimer = hs.timer.doEvery(10, checkServerHealth)
 
 local function playStartSound()
     if not ENABLE_SOUNDS then return end
-    local sound = hs.sound.getByName("Tink")
+    -- Use Morse instead of Tink — macOS's system alert sound is also Tink,
+    -- so when the event tap degrades and key events leak to the focused app,
+    -- the system alert beeps sound identical to our start sound.
+    -- Using a different sound makes it obvious which is which.
+    local sound = hs.sound.getByName("Morse")
     if sound then sound:play() end
 end
 
@@ -661,6 +665,16 @@ local function startRecordingProcess()
     -- sox `: newfile : restart` splits on silence into numbered files
     -- without reopening CoreAudio between chunks.
     currentRecordingTask = hs.task.new(REC_BINARY, function(exitCode, _stdout, stderr)
+        -- Gate: if a new session has started, this is a stale exit callback
+        -- from a previous rec process. Ignore it completely — touching any
+        -- global state here would clobber the new session (this was the root
+        -- cause of the repeated start-sound bug).
+        if currentSessionId ~= sessionId then
+            logWarn(string.format("rec exit callback from stale session %d (current %d), ignoring",
+                currentSessionId, sessionId))
+            return
+        end
+
         currentRecordingTask = nil
 
         logInfo(string.format("rec process exited (exit=%d, stderr=%s)",
@@ -722,6 +736,8 @@ local function killOrphanedRecProcesses()
     hs.execute("pkill -x rec 2>/dev/null", true)
 end
 
+local lastSessionStopTime = 0  -- epoch seconds when last session ended
+
 local function startRecording()
     if isRecording then
         logDebug("startRecording: already recording, ignoring")
@@ -739,7 +755,17 @@ local function startRecording()
 
     sessionId = sessionId + 1
 
-    logInfo(string.format("=== SESSION %d START ===", sessionId))
+    -- Detect Wooting bounce: if restarting within 2 seconds of last stop,
+    -- this is likely a false keyUp/keyDown cycle, not a real new session.
+    local timeSinceLastStop = hs.timer.secondsSinceEpoch() - lastSessionStopTime
+    local isRapidRestart = timeSinceLastStop < 2
+
+    if isRapidRestart then
+        logWarn(string.format("=== SESSION %d START (rapid restart, %.1fs since last stop) ===",
+            sessionId, timeSinceLastStop))
+    else
+        logInfo(string.format("=== SESSION %d START ===", sessionId))
+    end
 
     isRecording = true
     stopRequested = false
@@ -773,6 +799,8 @@ end
 
 local function stopRecording()
     if not isRecording then return end
+
+    lastSessionStopTime = hs.timer.secondsSinceEpoch()
 
     logInfo(string.format("=== SESSION %d STOP (key released) === chunks=%d activeTranscriptions=%d",
         sessionId, chunkCount, activeTranscriptions))
@@ -882,26 +910,40 @@ local keyWatcher = hs.eventtap.new({
 
     if keyCode ~= INSERT_KEY_CODE then return false end
 
-    if event:getType() == hs.eventtap.event.types.keyDown then
+    local eventType = event:getType()
+
+    if eventType == hs.eventtap.event.types.keyDown then
+        -- FAST PATH: auto-repeat or already-held events.
+        if insertKeyIsDown then
+            -- Inline watchdog: timers can be starved when the main thread is
+            -- overwhelmed with auto-repeat events, so the hs.timer watchdog
+            -- may never fire. Check elapsed time here in the hot path.
+            if isRecording and recordingStartTime
+               and (hs.timer.secondsSinceEpoch() - recordingStartTime) > MAX_SESSION_SECONDS then
+                logWarn("Inline watchdog: session exceeded " .. MAX_SESSION_SECONDS .. "s, force-stopping")
+                insertKeyIsDown = false
+                stopRecording()
+                return true
+            end
+            return true  -- consume with minimal work
+        end
+
         -- Cancel any pending debounced stop (Wooting sends false keyUp)
         if keyUpDebounceTimer then
             keyUpDebounceTimer:stop()
             keyUpDebounceTimer = nil
             logDebug("Debounce: cancelled pending stop (key re-pressed)")
-        end
-
-        -- Ignore if key is already logically down — this is the key fix.
-        -- Blocks macOS auto-repeat AND Wooting rapid trigger re-presses.
-        if insertKeyIsDown then
-            return true  -- consume event silently
+            return true
         end
 
         insertKeyIsDown = true
-        logDebug("Insert key DOWN")
+        logDebug("Insert key DOWN → startRecording")
         startRecording()
         return true
 
-    elseif event:getType() == hs.eventtap.event.types.keyUp then
+    elseif eventType == hs.eventtap.event.types.keyUp then
+        logDebug("Insert key UP (raw)")
+
         -- Debounce: don't stop immediately (Wooting rapid trigger jitter)
         if keyUpDebounceTimer then
             keyUpDebounceTimer:stop()
@@ -909,7 +951,7 @@ local keyWatcher = hs.eventtap.new({
         keyUpDebounceTimer = hs.timer.doAfter(DEBOUNCE_MS / 1000, function()
             keyUpDebounceTimer = nil
             insertKeyIsDown = false  -- only cleared here, after debounce
-            logDebug("Insert key UP (debounced)")
+            logDebug("Insert key UP (debounced) → stopRecording")
             stopRecording()
         end)
         return true
@@ -938,9 +980,14 @@ local function restartEventTap()
     end
 end
 
-local eventTapWatchdog = hs.timer.new(30, function()
+local EVENT_TAP_REFRESH_INTERVAL = 120  -- seconds between proactive tap refreshes
+
+local lastTapRefreshTime = hs.timer.secondsSinceEpoch()
+
+local eventTapWatchdog = hs.timer.new(15, function()
     if not keyWatcher:isEnabled() then
         restartEventTap()
+        lastTapRefreshTime = hs.timer.secondsSinceEpoch()
     end
 
     -- Safety valve: if insertKeyIsDown is stuck true but recording has ended,
@@ -953,6 +1000,19 @@ local eventTapWatchdog = hs.timer.new(30, function()
             keyUpDebounceTimer:stop()
             keyUpDebounceTimer = nil
         end
+    end
+
+    -- Proactive tap refresh: macOS's CGEventTap system can degrade over time
+    -- (internal throttling after kCGEventTapDisabledByTimeout events).
+    -- Periodically recreate the tap to reset OS-level state, just like a
+    -- Hammerspoon reload would. Only when idle (not recording).
+    local timeSinceRefresh = hs.timer.secondsSinceEpoch() - lastTapRefreshTime
+    if timeSinceRefresh >= EVENT_TAP_REFRESH_INTERVAL
+       and not isRecording and not insertKeyIsDown and activeTranscriptions == 0 then
+        logInfo("Proactive event tap refresh (every " .. EVENT_TAP_REFRESH_INTERVAL .. "s)")
+        keyWatcher:stop()
+        keyWatcher:start()
+        lastTapRefreshTime = hs.timer.secondsSinceEpoch()
     end
 end)
 
