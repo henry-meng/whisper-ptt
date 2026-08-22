@@ -913,6 +913,20 @@ local keyWatcher = hs.eventtap.new({
     local eventType = event:getType()
 
     if eventType == hs.eventtap.event.types.keyDown then
+        -- Cancel any pending debounced stop (Wooting sends false keyUp).
+        -- This MUST come before the insertKeyIsDown fast path below: a pending
+        -- debounce timer only ever exists while insertKeyIsDown is still true
+        -- (the timer is what clears it), so checking the fast path first made
+        -- this branch unreachable. The spurious keyUp then always won, stopping
+        -- the session mid-hold; the next auto-repeat keyDown started a fresh
+        -- one, cycling stop/start sounds for as long as the key was held.
+        if keyUpDebounceTimer then
+            keyUpDebounceTimer:stop()
+            keyUpDebounceTimer = nil
+            logDebug("Debounce: cancelled pending stop (key still held)")
+            return true
+        end
+
         -- FAST PATH: auto-repeat or already-held events.
         if insertKeyIsDown then
             -- Inline watchdog: timers can be starved when the main thread is
@@ -926,14 +940,6 @@ local keyWatcher = hs.eventtap.new({
                 return true
             end
             return true  -- consume with minimal work
-        end
-
-        -- Cancel any pending debounced stop (Wooting sends false keyUp)
-        if keyUpDebounceTimer then
-            keyUpDebounceTimer:stop()
-            keyUpDebounceTimer = nil
-            logDebug("Debounce: cancelled pending stop (key re-pressed)")
-            return true
         end
 
         insertKeyIsDown = true
