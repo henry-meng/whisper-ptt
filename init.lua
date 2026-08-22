@@ -129,7 +129,10 @@ local COLOR_ORANGE = { red = 0.95, green = 0.65, blue = 0.15, alpha = 1.0 }
 local COLOR_GRAY   = { red = 0.55, green = 0.55, blue = 0.55, alpha = 1.0 }
 
 local function setMenuBarState(color, tooltip, statusText)
-    menuBar:setIcon(makeMenuBarIcon(color))
+    -- template = false is required: hs.menubar defaults it to true, which makes
+    -- macOS discard the fill colour and tint the alpha mask to match the menu
+    -- bar (a flat black/white dot). All four states then render identically.
+    menuBar:setIcon(makeMenuBarIcon(color), false)
     menuBar:setTitle(nil)
     menuBar:setTooltip(tooltip)
     menuBar:setMenu({
@@ -1051,6 +1054,9 @@ end)
 -- ---------------------------------------------------------------------------
 -- Init
 -- ---------------------------------------------------------------------------
+
+-- Hide Hammerspoon's own menu bar icon; PTT's status dot is the only one wanted.
+hs.menuIcon(false)
 
 openLogFile()
 logInfo("========================================")
