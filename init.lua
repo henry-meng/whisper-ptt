@@ -73,6 +73,12 @@ local watchdogTimer         = nil
 local savedClipboard        = nil
 local activeTranscriptions  = 0
 
+-- Logical Insert-key state (only cleared by the debounced keyUp). Declared here
+-- rather than beside the event tap below because the max-session watchdog in
+-- startRecording() also resets it; declaring it lower down made that write
+-- silently create a global instead of touching this local.
+local insertKeyIsDown       = false
+
 -- Ordered paste queue: ensures phrases appear in recording order
 -- Uses `false` as sentinel for skipped/discarded chunks
 local pasteQueue            = {}      -- chunkIndex → text or false (skipped)
@@ -738,6 +744,12 @@ end
 
 local lastSessionStopTime = 0  -- epoch seconds when last session ended
 
+-- Forward declaration: startRecording's max-session watchdog calls
+-- stopRecording before it is defined below. Without this the call resolved to
+-- a nil global and the 120s limit died with "attempt to call a nil value",
+-- leaving the session recording forever.
+local stopRecording
+
 local function startRecording()
     if isRecording then
         logDebug("startRecording: already recording, ignoring")
@@ -797,7 +809,7 @@ local function startRecording()
     startRecordingProcess()
 end
 
-local function stopRecording()
+function stopRecording()  -- assigns the forward declaration above
     if not isRecording then return end
 
     lastSessionStopTime = hs.timer.secondsSinceEpoch()
@@ -891,7 +903,7 @@ end
 
 local DEBOUNCE_MS           = 300     -- ms to wait after keyUp before stopping (Wooting jitter)
 local keyUpDebounceTimer    = nil
-local insertKeyIsDown       = false   -- logical key state (only cleared by debounced keyUp)
+-- insertKeyIsDown is declared in the State block at the top of this file.
 
 local keyWatcher = hs.eventtap.new({
     hs.eventtap.event.types.keyDown,

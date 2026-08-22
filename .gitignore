@@ -3,3 +3,4 @@
 *.log
 *.profraw
 .DS_Store
+luac.out
