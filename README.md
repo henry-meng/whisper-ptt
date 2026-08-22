@@ -43,7 +43,7 @@ Chunks are transcribed in parallel with ongoing recording, so text appears phras
 ## Quick install
 
 ```bash
-git clone https://github.com/yourusername/whisper-ptt.git
+git clone https://github.com/henry-meng/whisper-ptt.git
 cd whisper-ptt
 chmod +x install.sh
 ./install.sh
@@ -215,7 +215,7 @@ Periods, commas, question marks, and exclamation points are also inserted automa
 3. Check the debug log: click the menu bar dot → "Show PTT Debug Log"
 4. Try reloading: click the menu bar dot → "Reload Hammerspoon"
 
-The event tap watchdog checks every 30 seconds and auto-restarts the hotkey listener if macOS kills it. You'll see a "PTT: Hotkey restored" alert if this happens.
+The event tap watchdog checks every 15 seconds and auto-restarts the hotkey listener if macOS kills it. You'll see a "PTT: Hotkey restored" alert if this happens.
 
 ### Whisper server not starting
 
@@ -264,8 +264,28 @@ brew install sox_ng
 
 - **Whisper server**: runs as a macOS LaunchAgent with `KeepAlive=true` and `RunAtLoad=true`. Starts at boot, auto-restarts on crash (with 15s throttle to prevent crash loops).
 - **Hammerspoon**: set to launch at login. Loads `init.lua` which starts the event tap and watchdog.
-- **Event tap watchdog**: polls every 30s to detect if macOS silently killed the hotkey listener. Auto-restarts it.
+- **Event tap watchdog**: polls every 15s to detect if macOS silently killed the hotkey listener. Auto-restarts it.
 - **Sleep/wake watcher**: re-checks the event tap 2s after the system wakes from sleep (macOS often kills event taps across sleep cycles).
+
+## Tests
+
+Two scripts guard the Insert-key handling. Both need `lua` (`brew install lua`).
+
+```bash
+lua test-key-debounce.lua    # one hold must produce exactly one session
+./test-no-global-leaks.sh    # no accidental globals in init.lua
+```
+
+`test-key-debounce.lua` models the keyDown/keyUp state machine on a virtual
+clock and replays a hold containing a spurious mid-hold keyUp, the pattern that
+used to restart the session and cycle the start/stop sounds.
+
+`test-no-global-leaks.sh` disassembles `init.lua` with `luac` and asserts every
+`_ENV` access is a genuine external name. Lua resolves names against the locals
+visible where the enclosing function is compiled, so referencing something
+declared later in the file silently targets a global — no syntax error, no
+warning. That bug class once left the 120s session watchdog calling a nil
+`stopRecording`, so it never fired at all.
 
 ## License
 
