@@ -60,6 +60,29 @@ local function logWarn(message)  log("WARN",  message) end
 local function logError(message) log("ERROR", message) end
 
 -- ---------------------------------------------------------------------------
+-- GC anchor
+--
+-- init.lua's chunk is released once Hammerspoon finishes loading it, so any
+-- chunk-level local holding an event tap, timer or watcher becomes collectable.
+-- When a GC cycle runs -- reliably triggered by the allocation churn of a long
+-- transcription session -- those objects are freed and silently stop working:
+-- no error, no callback, and hs.eventtap:isEnabled() still reports true.
+--
+-- Observed 2026-08-22: the event tap stopped delivering mid-session (a fresh
+-- tap in the same process saw the events fine), and the watchdog timer stopped
+-- firing during a 123-chunk session even with its body wrapped in pcall.
+--
+-- This table is a deliberate global: it is reachable from _ENV, so everything
+-- stored in it is a GC root and survives for the life of the config.
+--
+-- It also makes the runtime inspectable from the Hammerspoon console, which is
+-- how the *second* cause of a dead watchdog was found: after a sleep/wake cycle
+-- PTT_RUNTIME.eventTapWatchdog was still a live object but reported
+-- running=false. hs.timer does not survive system sleep. See
+-- ensureWatchdogRunning below.
+PTT_RUNTIME = {}
+
+-- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
 
@@ -908,10 +931,88 @@ local DEBOUNCE_MS           = 300     -- ms to wait after keyUp before stopping 
 local keyUpDebounceTimer    = nil
 -- insertKeyIsDown is declared in the State block at the top of this file.
 
-local keyWatcher = hs.eventtap.new({
-    hs.eventtap.event.types.keyDown,
-    hs.eventtap.event.types.keyUp,
-}, function(event)
+-- Lost-keyUp recovery.
+--
+-- macOS sometimes never delivers the keyUp for the Insert key. When that
+-- happens the session has no way to end: the debounce never fires, the safety
+-- valve below requires `not isRecording`, and the event tap still reports
+-- itself healthy -- so recording ran until the 120s watchdog, pasting
+-- transcriptions the whole time (ptt-debug.log 2026-08-22 14:58:29, session 4).
+--
+-- While a key is physically held, macOS delivers auto-repeat keyDowns
+-- continuously. Their absence is therefore a reliable release signal. To stay
+-- safe on hardware that does not auto-repeat this key, the heuristic is only
+-- trusted after this hold has already produced MIN_REPEATS_TO_TRUST of them;
+-- otherwise behaviour is unchanged.
+local HOLD_POLL_INTERVAL    = 0.25    -- seconds between lost-keyUp checks
+local LOST_KEYUP_TIMEOUT    = 2.0     -- no auto-repeat for this long => released
+local MIN_REPEATS_TO_TRUST  = 3       -- proof this keyboard auto-repeats
+
+local repeatsThisHold       = 0
+local lastRepeatTime        = 0
+local holdWatchdog          = nil
+
+-- Event tap liveness.
+--
+-- hs.eventtap:isEnabled() cannot be trusted: a tap can report enabled while
+-- delivering no callbacks at all. Verified 2026-08-22 -- during a 3s hold the
+-- live keyWatcher logged nothing while a freshly created tap in the same
+-- process received 31 keyCode-114 events. A dead tap also stops *consuming*
+-- Insert, so auto-repeat reaches the frontmost app, which beeps on every one.
+--
+-- So liveness is tracked by observation instead: every event the tap delivers
+-- stamps lastTapEventTime, and recovery recreates the tap object rather than
+-- stop/start-ing a poisoned one.
+local lastTapEventTime      = hs.timer.secondsSinceEpoch()
+local tapGeneration         = 0
+local createKeyWatcher              -- defined below, after the event handler
+
+local function stopHoldWatchdog()
+    if holdWatchdog then
+        holdWatchdog:stop()
+        holdWatchdog = nil
+        PTT_RUNTIME.holdWatchdog = nil
+    end
+end
+
+local function startHoldWatchdog()
+    stopHoldWatchdog()
+    holdWatchdog = hs.timer.doEvery(HOLD_POLL_INTERVAL, function()
+        if not insertKeyIsDown then return end
+        if repeatsThisHold < MIN_REPEATS_TO_TRUST then return end
+
+        local since = hs.timer.secondsSinceEpoch() - lastRepeatTime
+        if since > LOST_KEYUP_TIMEOUT then
+            logWarn(string.format(
+                "Lost keyUp: auto-repeat stopped %.1fs ago after %d repeats — treating as release",
+                since, repeatsThisHold))
+            insertKeyIsDown = false
+            if keyUpDebounceTimer then
+                keyUpDebounceTimer:stop()
+                keyUpDebounceTimer = nil
+            end
+            stopHoldWatchdog()
+            stopRecording()
+
+            -- Auto-repeat stopping means either a real release whose keyUp was
+            -- dropped, or a tap that has gone silent. Both are repaired by a
+            -- fresh tap, and recreating one while no key is held is harmless.
+            if hs.timer.secondsSinceEpoch() - lastTapEventTime > LOST_KEYUP_TIMEOUT then
+                logWarn("No tap events at all during that window — recreating event tap")
+                createKeyWatcher()
+            end
+        end
+    end)
+    PTT_RUNTIME.holdWatchdog = holdWatchdog   -- GC anchor
+end
+
+local keyWatcher = nil
+
+local function handleKeyEvent(event)
+    -- Stamp every delivered event, whatever key it was. This is the only
+    -- trustworthy evidence the tap is alive.
+    lastTapEventTime = hs.timer.secondsSinceEpoch()
+
     local keyCode = event:getKeyCode()
 
     -- Escape cancels recording
@@ -951,13 +1052,24 @@ local keyWatcher = hs.eventtap.new({
                and (hs.timer.secondsSinceEpoch() - recordingStartTime) > MAX_SESSION_SECONDS then
                 logWarn("Inline watchdog: session exceeded " .. MAX_SESSION_SECONDS .. "s, force-stopping")
                 insertKeyIsDown = false
+                stopHoldWatchdog()
                 stopRecording()
                 return true
+            end
+            -- Record the auto-repeat so the hold watchdog can tell a held key
+            -- from one whose keyUp was dropped.
+            repeatsThisHold = repeatsThisHold + 1
+            lastRepeatTime = hs.timer.secondsSinceEpoch()
+            if repeatsThisHold == MIN_REPEATS_TO_TRUST then
+                logDebug("Auto-repeat confirmed — lost-keyUp recovery armed")
             end
             return true  -- consume with minimal work
         end
 
         insertKeyIsDown = true
+        repeatsThisHold = 0
+        lastRepeatTime = hs.timer.secondsSinceEpoch()
+        startHoldWatchdog()
         logDebug("Insert key DOWN → startRecording")
         startRecording()
         return true
@@ -972,6 +1084,7 @@ local keyWatcher = hs.eventtap.new({
         keyUpDebounceTimer = hs.timer.doAfter(DEBOUNCE_MS / 1000, function()
             keyUpDebounceTimer = nil
             insertKeyIsDown = false  -- only cleared here, after debounce
+            stopHoldWatchdog()
             logDebug("Insert key UP (debounced) → stopRecording")
             stopRecording()
         end)
@@ -979,7 +1092,30 @@ local keyWatcher = hs.eventtap.new({
     end
 
     return false
-end)
+end
+
+-- Builds a brand new tap. Always prefer this over keyWatcher:stop()/start():
+-- once macOS has poisoned a tap, restarting the same object does not revive it.
+function createKeyWatcher()
+    if keyWatcher then
+        keyWatcher:stop()
+        keyWatcher = nil
+    end
+
+    tapGeneration = tapGeneration + 1
+    keyWatcher = hs.eventtap.new({
+        hs.eventtap.event.types.keyDown,
+        hs.eventtap.event.types.keyUp,
+    }, handleKeyEvent)
+    keyWatcher:start()
+    PTT_RUNTIME.keyWatcher = keyWatcher   -- GC anchor
+    lastTapEventTime = hs.timer.secondsSinceEpoch()
+
+    local ok = keyWatcher:isEnabled()
+    logInfo(string.format("Event tap created (generation %d, enabled=%s)", tapGeneration, tostring(ok)))
+    if PTT_RUNTIME.ensureWatchdogRunning then PTT_RUNTIME.ensureWatchdogRunning() end
+    return ok
+end
 
 -- ---------------------------------------------------------------------------
 -- Event Tap Watchdog
@@ -987,53 +1123,85 @@ end)
 -- callback timeout). This timer detects dead taps and restarts them.
 -- ---------------------------------------------------------------------------
 
-local function restartEventTap()
-    logWarn("Event tap is dead — attempting restart")
-    keyWatcher:stop()
-    keyWatcher:start()
-
-    if keyWatcher:isEnabled() then
-        logInfo("Event tap restarted successfully")
-        hs.alert.show("PTT: Hotkey restored", 2)
-    else
-        logError("Event tap restart FAILED — accessibility permission likely revoked")
-        hs.alert.show("⚠ PTT: Hotkey broken — check Accessibility permissions", 5)
+-- hs.timer stops across system sleep: the object stays alive but never fires
+-- again, and nothing reports it. Observed 2026-08-24 -- the heartbeat stopped
+-- before a sleep and never resumed, while the sleep watcher (event-driven, not
+-- a timer) kept working for two more days. Anything that can notice a wake must
+-- therefore re-arm the timer.
+local function ensureWatchdogRunning()
+    local watchdog = PTT_RUNTIME.eventTapWatchdog
+    if watchdog and not watchdog:running() then
+        logWarn("Watchdog timer was stopped (system sleep stops hs.timer) — restarting")
+        watchdog:start()
     end
 end
 
-local EVENT_TAP_REFRESH_INTERVAL = 120  -- seconds between proactive tap refreshes
+local function restartEventTap()
+    logWarn("Event tap unhealthy — recreating")
+    if createKeyWatcher() then
+        logInfo("Event tap restored")
+        hs.alert.show("PTT: Hotkey restored", 2)
+    else
+        logError("Event tap creation FAILED — accessibility permission likely revoked")
+        hs.alert.show("\u{26A0} PTT: Hotkey broken — check Accessibility permissions", 5)
+    end
+end
+
+local EVENT_TAP_REFRESH_INTERVAL = 60   -- seconds between proactive tap rebuilds
+local WATCHDOG_INTERVAL          = 15   -- seconds between health checks
 
 local lastTapRefreshTime = hs.timer.secondsSinceEpoch()
+local watchdogTicks      = 0
 
-local eventTapWatchdog = hs.timer.new(15, function()
-    if not keyWatcher:isEnabled() then
-        restartEventTap()
-        lastTapRefreshTime = hs.timer.secondsSinceEpoch()
-    end
+-- The body is wrapped in pcall deliberately. A Lua error thrown from an
+-- hs.timer callback can stop the timer permanently and silently, which is the
+-- most likely reason the previous watchdog simply stopped running mid-session
+-- (its last proactive refresh logged at 15:29:04 on 2026-08-22 and never
+-- again, with no error surfaced anywhere).
+local eventTapWatchdog = hs.timer.new(WATCHDOG_INTERVAL, function()
+    local ok, err = pcall(function()
+        watchdogTicks = watchdogTicks + 1
+        local now = hs.timer.secondsSinceEpoch()
 
-    -- Safety valve: if insertKeyIsDown is stuck true but recording has ended,
-    -- the keyUp event was likely lost (macOS kCGEventTapDisabledByTimeout).
-    -- Reset so the next keyDown can start a new session.
-    if insertKeyIsDown and not isRecording and activeTranscriptions == 0 then
-        logWarn("Safety valve: insertKeyIsDown stuck after session ended — resetting (keyUp likely lost)")
-        insertKeyIsDown = false
-        if keyUpDebounceTimer then
-            keyUpDebounceTimer:stop()
-            keyUpDebounceTimer = nil
+        -- Heartbeat, once a minute: if this stops appearing, the watchdog
+        -- itself has died and that is the bug to chase, not the tap.
+        if watchdogTicks % 4 == 0 then
+            logDebug(string.format("Watchdog alive (tick %d, tap generation %d, %.0fs since last tap event)",
+                watchdogTicks, tapGeneration, now - lastTapEventTime))
         end
-    end
 
-    -- Proactive tap refresh: macOS's CGEventTap system can degrade over time
-    -- (internal throttling after kCGEventTapDisabledByTimeout events).
-    -- Periodically recreate the tap to reset OS-level state, just like a
-    -- Hammerspoon reload would. Only when idle (not recording).
-    local timeSinceRefresh = hs.timer.secondsSinceEpoch() - lastTapRefreshTime
-    if timeSinceRefresh >= EVENT_TAP_REFRESH_INTERVAL
-       and not isRecording and not insertKeyIsDown and activeTranscriptions == 0 then
-        logInfo("Proactive event tap refresh (every " .. EVENT_TAP_REFRESH_INTERVAL .. "s)")
-        keyWatcher:stop()
-        keyWatcher:start()
-        lastTapRefreshTime = hs.timer.secondsSinceEpoch()
+        if not keyWatcher or not keyWatcher:isEnabled() then
+            restartEventTap()
+            lastTapRefreshTime = hs.timer.secondsSinceEpoch()
+            return
+        end
+
+        -- Safety valve: insertKeyIsDown stuck with no recording in progress.
+        -- Deliberately NOT gated on activeTranscriptions: if that counter ever
+        -- drifts non-zero this check would disable itself forever.
+        if insertKeyIsDown and not isRecording then
+            logWarn("Safety valve: insertKeyIsDown stuck after session ended — resetting")
+            insertKeyIsDown = false
+            if keyUpDebounceTimer then
+                keyUpDebounceTimer:stop()
+                keyUpDebounceTimer = nil
+            end
+            stopHoldWatchdog()
+        end
+
+        -- Proactive rebuild. macOS degrades taps over time and isEnabled()
+        -- will not tell us, so replace the object on a schedule rather than
+        -- waiting for a diagnosis. Skipped only while actually recording,
+        -- where a rebuild could drop the release event.
+        if (now - lastTapRefreshTime) >= EVENT_TAP_REFRESH_INTERVAL and not isRecording then
+            logDebug("Proactive event tap rebuild (every " .. EVENT_TAP_REFRESH_INTERVAL .. "s)")
+            createKeyWatcher()
+            lastTapRefreshTime = hs.timer.secondsSinceEpoch()
+        end
+    end)
+
+    if not ok then
+        logError("Watchdog tick failed: " .. tostring(err))
     end
 end)
 
@@ -1042,11 +1210,10 @@ local sleepWatcher = hs.caffeinate.watcher.new(function(eventType)
     if eventType == hs.caffeinate.watcher.systemDidWake then
         logInfo("System woke from sleep — checking event tap health")
         hs.timer.doAfter(2, function()
-            if not keyWatcher:isEnabled() then
-                restartEventTap()
-            else
-                logDebug("Event tap healthy after wake")
-            end
+            -- Rebuild unconditionally: isEnabled() cannot distinguish a healthy
+            -- tap from one macOS silently stopped delivering to across sleep.
+            createKeyWatcher()
+            ensureWatchdogRunning()
         end)
     end
 end)
@@ -1077,9 +1244,15 @@ killOrphanedRecProcesses()
 validateWordFixes()
 
 showServerDown()
-keyWatcher:start()
+createKeyWatcher()
 eventTapWatchdog:start()
 sleepWatcher:start()
+
+-- GC anchors for everything that must outlive init.lua's chunk.
+PTT_RUNTIME.eventTapWatchdog = eventTapWatchdog
+PTT_RUNTIME.ensureWatchdogRunning = ensureWatchdogRunning
+PTT_RUNTIME.sleepWatcher     = sleepWatcher
+PTT_RUNTIME.menuBar          = menuBar
 checkServerHealth()
 
 logInfo("PTT ready — waiting for Insert key")
